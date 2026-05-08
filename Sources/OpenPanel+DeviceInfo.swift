@@ -157,8 +157,8 @@ extension OpenPanel {
   final class WiFiMonitor: Sendable {
     private let lockedState = OSAllocatedUnfairLock<Bool?>(initialState: nil)
     #if canImport(Network)
-    // `NWPathMonitor` does not self-retain — it must be held strongly for
-    // `pathUpdateHandler` to keep firing past the end of `init`.
+    /// `NWPathMonitor` does not self-retain — it must be held strongly for
+    /// `pathUpdateHandler` to keep firing past the end of `init`.
     private let pathMonitor: NWPathMonitor
     #endif
 

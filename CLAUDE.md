@@ -15,33 +15,42 @@ No `.xcodeproj` — SwiftPM only. CI builds on iOS / macOS / tvOS.
 
 ## Public API shape
 
-`OpenPanel` is a shared singleton (`public static let shared`). `init` is
-private; callers interact through the static facade:
+`OpenPanel` is a shared singleton accessed via `public static var shared`.
+The actor instance is held in a lock-protected slot (`OpenPanel._shared`,
+an `OSAllocatedUnfairLock<OpenPanel?>`) so `initialize` can swap it in
+synchronously. Callers interact through the static facade:
 
 ```swift
-OpenPanel.initialize(…)          // synchronous, fire-and-forget
-OpenPanel.track("e", …)         // all other methods — also fire-and-forget
+OpenPanel.initialize(…)          // truly synchronous — when it returns, the SDK is ready
+OpenPanel.track("e", …)         // all other methods — fire-and-forget
 ```
 
-Public **methods** are synchronous and non-throwing. Calls spawn internal
-`Task`s that hop onto the actor; network I/O, retries, and error handling
+`initialize(_:disabled:)` constructs a fresh `OpenPanel` actor on the
+calling thread and stores it under the lock — no `Task`, no `await`.
+Calling it a second time replaces the singleton with a brand-new actor;
+the previous instance (and any in-flight tasks holding a reference to it)
+is discarded. Every other static method is fire-and-forget: it spawns a
+`Task` that hops onto the actor; network I/O, retries, and error handling
 happen in the background. Errors are logged when `debug: true`. The two
 public **read-only properties** `OpenPanel.deviceId` / `OpenPanel.sessionId`
 are `async` (they read state from the actor).
 
-Calling any method before `initialize` is a **fatal error** (`fatalError`).
-This is intentional — the SDK must be initialized before use.
+Calling any property or method on `OpenPanel.shared` before `initialize`
+is a **fatal error** (`fatalError`) — the trap lives in the `shared`
+getter, so misuse surfaces synchronously at the call site.
 
 Instance methods on the actor are `async` (actor isolation) — the static
 facade wraps them in `Task`. When adding a new public method, add both the
-instance method and the static wrapper.
+instance method and the static wrapper. `config` and `transport` are `let`
+on each actor instance — to change them at runtime, call `initialize`
+again.
 
 ## Architecture
 
-- `Sources/OpenPanel.swift` — public `actor OpenPanel`, the entry point (singleton + state only)
+- `Sources/OpenPanel.swift` — public `actor OpenPanel`, the entry point. Holds the lock-protected `_shared` slot, the synchronous `shared` getter (traps if uninitialized), and per-instance state.
 - `Sources/OpenPanel+Config.swift`, `OpenPanel+Error.swift` — public nested types
-- `Sources/OpenPanel+API.swift` — public instance methods + the static fire-and-forget facade
-- `Sources/OpenPanel+Helpers.swift` — internal `send`/`drainQueue`/`log`/`ensureInitialized` plus the test-only `initialize(_:session:)` and `resetForTesting()` overloads
+- `Sources/OpenPanel+API.swift` — public instance methods + the static facade (synchronous `initialize`, fire-and-forget for everything else)
+- `Sources/OpenPanel+Helpers.swift` — internal `send`/`drainQueue`/`log` plus the test-only static `initialize(_:session:)` and `resetForTesting()` helpers
 - `Sources/OpenPanel+Transport.swift` — internal `Transport` struct (HTTP, retries, 401 silent-drop)
 - `Sources/Models/` — payload types. **Public:** `OpenPanelEvent` (discriminated envelope), `TrackPayload`, `IdentifyPayload`, `GroupPayload`, `AssignGroupPayload`, `IncrementPayload`, `DecrementPayload`, `AliasPayload`, `ProfileId`. **Internal:** `TrackResponse` (server response shape, not part of the public surface).
 - `Sources/OpenPanel+DeviceInfo.swift` — internal `enum DeviceInfo` + `WiFiMonitor`; resolves device metadata stamped onto `track` events.
@@ -81,4 +90,4 @@ When adding a type, decide public vs. internal first. Public payloads go in `Sou
 - New suite → `extension MockBackedSuite { @Suite("Name") struct MyTests { … } }`.
 - `MockURLProtocol.install { req in .success(.ok()) }` at the top of each test; `.reset()` is not needed because `install` resets captured state.
 - Tests call instance methods (`await OpenPanel.shared.track(…)`) directly, NOT the static facade — static methods are fire-and-forget and return before the work completes.
-- Singleton state persists across tests. Each test must call `OpenPanel.shared.initialize(…, session:)` (internal overload, injects mock session and resets state) before exercising the API. To assert pre-init behaviour, call `await OpenPanel.shared.resetForTesting()` — `internal`, reachable only via `@testable import OpenPanel`.
+- Singleton state persists across tests. Each test must call `OpenPanel.initialize(…, session:)` (internal static overload, injects mock session and replaces the singleton) before exercising the API. Both that overload and `OpenPanel.resetForTesting()` are `internal` and reachable only via `@testable import OpenPanel`. `resetForTesting()` clears the `_shared` slot — call it to assert pre-init (uninitialized) behaviour.

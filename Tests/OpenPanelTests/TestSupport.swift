@@ -37,7 +37,7 @@ struct ConfiguredOpenPanel: TestTrait, TestScoping {
       waitForProfile: waitForProfile,
       filter: filter
     )
-    await OpenPanel.shared.initialize(config, session: MockURLProtocol.makeSession(), disabled: disabled)
+    OpenPanel.initialize(config, session: MockURLProtocol.makeSession(), disabled: disabled)
     try await function()
   }
 }

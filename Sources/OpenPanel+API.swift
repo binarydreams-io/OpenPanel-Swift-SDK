@@ -10,44 +10,24 @@ import Foundation
 // MARK: - Public instance API
 
 public extension OpenPanel {
-  /// Configure the singleton. Must be called before any other public API.
-  /// Calling a second time replaces the config/transport and resets all cached state.
-  /// Pass `disabled: true` to queue events until ``ready()`` is called.
-  func initialize(_ config: Config, disabled: Bool = false) {
-    self.config = config
-    transport = Transport(config: config)
-    profileId = nil
-    groups.removeAll()
-    global.removeAll()
-    queue.removeAll()
-    deviceId = nil
-    sessionId = nil
-    self.disabled = disabled
-    waitingForProfile = config.waitForProfile
-    draining = false
-  }
-
   /// Unblock queued events. Pair with `initialize(_:, disabled: true)` for deferred startup.
   func ready() async {
-    ensureInitialized()
     disabled = false
     await drainQueue()
   }
 
   /// Reset cached identity (profile, groups, device, session).
   func clear() {
-    ensureInitialized()
     profileId = nil
     groups.removeAll()
     deviceId = nil
     sessionId = nil
-    if config?.waitForProfile == true {
+    if config.waitForProfile {
       waitingForProfile = true
     }
   }
 
   func setGlobalProperties(_ properties: [String: String]) {
-    ensureInitialized()
     global.merge(stripReserved(properties)) { _, new in new }
   }
 
@@ -57,7 +37,6 @@ public extension OpenPanel {
     profileId: ProfileId? = nil,
     groups: [String]? = nil
   ) async {
-    ensureInitialized()
     let payload = buildTrackPayload(
       name: name,
       userProperties: properties,
@@ -71,13 +50,10 @@ public extension OpenPanel {
   /// Merge `alias` (often the anonymous profile id assigned before login) into
   /// `profileId` (the canonical, post-login id) server-side.
   func alias(profileId: String, alias: String) async {
-    ensureInitialized()
     await send(.alias(AliasPayload(profileId: profileId, alias: alias)))
   }
 
   func identify(_ payload: IdentifyPayload) async {
-    ensureInitialized()
-
     profileId = payload.profileId
     waitingForProfile = false
 
@@ -104,12 +80,10 @@ public extension OpenPanel {
   }
 
   func upsertGroup(_ payload: GroupPayload) async {
-    ensureInitialized()
     await send(.group(payload))
   }
 
   func setGroup(_ groupId: String) async {
-    ensureInitialized()
     guard !groups.contains(groupId) else { return }
     groups.insert(groupId)
     guard let profileId else {
@@ -120,7 +94,6 @@ public extension OpenPanel {
   }
 
   func setGroups(_ groupIds: [String]) async {
-    ensureInitialized()
     let newGroups = groupIds.filter { !groups.contains($0) }
     guard !newGroups.isEmpty else { return }
     groups.formUnion(newGroups)
@@ -132,7 +105,6 @@ public extension OpenPanel {
   }
 
   func increment(property: String, value: Double? = nil, profileId: ProfileId? = nil) async {
-    ensureInitialized()
     guard let resolvedProfileId = profileId ?? self.profileId else {
       log("Ignored increment('\(property)') — no profileId set")
       return
@@ -141,7 +113,6 @@ public extension OpenPanel {
   }
 
   func decrement(property: String, value: Double? = nil, profileId: ProfileId? = nil) async {
-    ensureInitialized()
     guard let resolvedProfileId = profileId ?? self.profileId else {
       log("Ignored decrement('\(property)') — no profileId set")
       return
@@ -152,7 +123,6 @@ public extension OpenPanel {
   /// Revenue is a regular `track` event named `"revenue"` with a reserved `__revenue` property.
   /// The server requires a client secret for revenue unless the project allows unsafe revenue.
   func revenue(_ amount: Double, properties: [String: String]? = nil, deviceId: String? = nil) async {
-    ensureInitialized()
     var reservedProperties = ["__revenue": String(amount)]
     if let deviceId { reservedProperties["__deviceId"] = deviceId }
     let payload = buildTrackPayload(
@@ -166,17 +136,17 @@ public extension OpenPanel {
   }
 
   func flush() async {
-    ensureInitialized()
     await drainQueue()
   }
 }
 
-// MARK: - Static facade (fire-and-forget)
+// MARK: - Static facade
 
 /// Synchronous, non-throwing entry points for callers that don't want to
-/// `await`. Each method spawns an unstructured `Task` that hops onto the
-/// actor, then returns immediately. Errors are caught and logged inside
-/// the actor — they never surface here.
+/// `await`. ``initialize(_:disabled:)`` does its work synchronously: when it
+/// returns, the SDK is ready. Every other static method is fire-and-forget —
+/// it spawns an unstructured `Task` that hops onto the actor and returns
+/// immediately. Errors are caught and logged inside the actor.
 ///
 /// Ordering caveat: the Swift runtime does not guarantee that two
 /// back-to-back `Task {}` invocations will reach the actor in submission
@@ -185,27 +155,34 @@ public extension OpenPanel {
 /// ordering must use the instance API (`await OpenPanel.shared.track(…)`)
 /// instead.
 public extension OpenPanel {
-  /// Configure the singleton. Returns immediately; the actor work runs
-  /// asynchronously.
+  /// Configure the singleton synchronously. Must be called before any other
+  /// public API. Calling a second time replaces the singleton with a fresh
+  /// actor — all cached state (profile, groups, queue, device/session ids)
+  /// is reset. Pass `disabled: true` to queue events until ``ready()`` is
+  /// called.
   static func initialize(_ config: Config, disabled: Bool = false) {
-    Task(name: "OpenPanel.initialize") { await shared.initialize(config, disabled: disabled) }
+    let instance = OpenPanel(config: config, transport: Transport(config: config), disabled: disabled)
+    _shared.withLock { $0 = instance }
   }
 
   /// Unblock queued events. See instance ``ready()``.
   static func ready() {
-    Task(name: "OpenPanel.ready") { await shared.ready() }
+    let instance = shared
+    Task(name: "OpenPanel.ready") { await instance.ready() }
   }
 
   /// Reset cached identity (profile, groups, device, session).
   /// Does NOT clear global properties. See instance ``clear()``.
   static func clear() {
-    Task(name: "OpenPanel.clear") { await shared.clear() }
+    let instance = shared
+    Task(name: "OpenPanel.clear") { await instance.clear() }
   }
 
   /// Merge into the global property map. Reserved (`__`-prefixed) keys
   /// are stripped. See instance ``setGlobalProperties(_:)``.
   static func setGlobalProperties(_ properties: [String: String]) {
-    Task(name: "OpenPanel.setGlobalProperties") { await shared.setGlobalProperties(properties) }
+    let instance = shared
+    Task(name: "OpenPanel.setGlobalProperties") { await instance.setGlobalProperties(properties) }
   }
 
   /// Send a track event. Stamped with device metadata, merged with global
@@ -216,48 +193,55 @@ public extension OpenPanel {
     profileId: ProfileId? = nil,
     groups: [String]? = nil
   ) {
+    let instance = shared
     Task(name: "OpenPanel.track") {
-      await shared.track(name, properties: properties, profileId: profileId, groups: groups)
+      await instance.track(name, properties: properties, profileId: profileId, groups: groups)
     }
   }
 
   /// Set the active profile and optionally update profile attributes.
   /// See instance ``identify(_:)``.
   static func identify(_ payload: IdentifyPayload) {
-    Task(name: "OpenPanel.identify") { await shared.identify(payload) }
+    let instance = shared
+    Task(name: "OpenPanel.identify") { await instance.identify(payload) }
   }
 
   /// Create or update a group record. See instance ``upsertGroup(_:)``.
   static func upsertGroup(_ payload: GroupPayload) {
-    Task(name: "OpenPanel.upsertGroup") { await shared.upsertGroup(payload) }
+    let instance = shared
+    Task(name: "OpenPanel.upsertGroup") { await instance.upsertGroup(payload) }
   }
 
   /// Attach the current profile to a group. Requires a `profileId` to have
   /// been set via ``identify(_:)``; otherwise it logs and skips the network
   /// request. See instance ``setGroup(_:)``.
   static func setGroup(_ groupId: String) {
-    Task(name: "OpenPanel.setGroup") { await shared.setGroup(groupId) }
+    let instance = shared
+    Task(name: "OpenPanel.setGroup") { await instance.setGroup(groupId) }
   }
 
   /// Attach the current profile to multiple groups at once.
   /// See instance ``setGroups(_:)``.
   static func setGroups(_ groupIds: [String]) {
-    Task(name: "OpenPanel.setGroups") { await shared.setGroups(groupIds) }
+    let instance = shared
+    Task(name: "OpenPanel.setGroups") { await instance.setGroups(groupIds) }
   }
 
   /// Increment a numeric profile property. Requires a `profileId`.
   /// See instance ``increment(property:value:profileId:)``.
   static func increment(property: String, value: Double? = nil, profileId: ProfileId? = nil) {
+    let instance = shared
     Task(name: "OpenPanel.increment") {
-      await shared.increment(property: property, value: value, profileId: profileId)
+      await instance.increment(property: property, value: value, profileId: profileId)
     }
   }
 
   /// Decrement a numeric profile property. Requires a `profileId`.
   /// See instance ``decrement(property:value:profileId:)``.
   static func decrement(property: String, value: Double? = nil, profileId: ProfileId? = nil) {
+    let instance = shared
     Task(name: "OpenPanel.decrement") {
-      await shared.decrement(property: property, value: value, profileId: profileId)
+      await instance.decrement(property: property, value: value, profileId: profileId)
     }
   }
 
@@ -265,19 +249,22 @@ public extension OpenPanel {
   /// `__deviceId` are added by the SDK.
   /// See instance ``revenue(_:properties:deviceId:)``.
   static func revenue(_ amount: Double, properties: [String: String]? = nil, deviceId: String? = nil) {
-    Task(name: "OpenPanel.revenue") { await shared.revenue(amount, properties: properties, deviceId: deviceId) }
+    let instance = shared
+    Task(name: "OpenPanel.revenue") { await instance.revenue(amount, properties: properties, deviceId: deviceId) }
   }
 
   /// Merge `alias` into `profileId` server-side. See instance
   /// ``alias(profileId:alias:)``.
   static func alias(profileId: String, alias: String) {
-    Task(name: "OpenPanel.alias") { await shared.alias(profileId: profileId, alias: alias) }
+    let instance = shared
+    Task(name: "OpenPanel.alias") { await instance.alias(profileId: profileId, alias: alias) }
   }
 
   /// Drain the in-memory queue. No-op while `disabled` or
   /// `waitingForProfile` is set. See instance ``flush()``.
   static func flush() {
-    Task(name: "OpenPanel.flush") { await shared.flush() }
+    let instance = shared
+    Task(name: "OpenPanel.flush") { await instance.flush() }
   }
 
   /// Server-issued device identifier, or `nil` until the first successful

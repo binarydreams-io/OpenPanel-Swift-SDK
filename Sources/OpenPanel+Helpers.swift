@@ -9,47 +9,21 @@ import Foundation
 import os
 
 extension OpenPanel {
-  /// Internal overload that injects a custom `URLSession` (for testing with `MockURLProtocol`).
-  func initialize(_ config: Config, session: URLSession, disabled: Bool = false) {
-    self.config = config
-    transport = Transport(config: config, session: session)
-    profileId = nil
-    groups.removeAll()
-    global.removeAll()
-    queue.removeAll()
-    deviceId = nil
-    sessionId = nil
-    self.disabled = disabled
-    waitingForProfile = config.waitForProfile
-    draining = false
+  /// Test-only static initializer that injects a custom `URLSession`
+  /// (used with `MockURLProtocol`). Replaces the singleton synchronously.
+  static func initialize(_ config: Config, session: URLSession, disabled: Bool = false) {
+    let instance = OpenPanel(
+      config: config,
+      transport: Transport(config: config, session: session),
+      disabled: disabled
+    )
+    _shared.withLock { $0 = instance }
   }
 
   /// Fully un-configures the singleton. Only for tests — `@testable import OpenPanel`
   /// is required to reach it. Not part of the public API.
-  func resetForTesting() {
-    config = nil
-    transport = nil
-    profileId = nil
-    groups.removeAll()
-    global.removeAll()
-    queue.removeAll()
-    deviceId = nil
-    sessionId = nil
-    disabled = false
-    waitingForProfile = false
-    draining = false
-  }
-
-  /// Crashes if the SDK has not been configured.
-  ///
-  /// Calling any public method before `initialize` is an intentional **fatal error**:
-  /// analytics from the very first launch (`app_launch`, etc.) are critical, and a silent
-  /// no-op would let the bug ship to production. The crash surfaces the misuse on the first
-  /// dev run so the developer can re-order initialization before any other code path.
-  func ensureInitialized() {
-    guard config != nil, transport != nil else {
-      fatalError("[OpenPanel] SDK not initialized. Call OpenPanel.initialize(_:) first.")
-    }
+  static func resetForTesting() {
+    _shared.withLock { $0 = nil }
   }
 
   /// Builds a `TrackPayload` from caller-supplied data plus SDK-managed
@@ -104,15 +78,13 @@ extension OpenPanel {
   }
 
   func log(_ message: @autoclosure () -> String, to logger: Logger = OpenPanel.apiLog) {
-    guard config?.debug == true else { return }
+    guard config.debug else { return }
     let formattedMessage = message()
     logger.debug("\(formattedMessage)")
   }
 
   @discardableResult
   func send(_ envelope: OpenPanelEvent) async -> Bool {
-    guard let config, transport != nil else { return false }
-
     if let filter = config.filter, !filter(envelope) {
       log("Filtered event: \(envelope)")
       return true
@@ -138,7 +110,6 @@ extension OpenPanel {
   /// go through ``send(_:)`` so the queue/filter checks apply.
   @discardableResult
   func sendDirect(_ envelope: OpenPanelEvent) async -> Bool {
-    guard let transport else { return false }
     log("Sending event: \(envelope)", to: OpenPanel.transportLog)
     do {
       let response: TrackResponse? = try await transport.post(path: "/track", body: envelope)
@@ -182,7 +153,7 @@ extension OpenPanel {
   /// past us, so wire order matches submission order. Re-entrant calls are
   /// no-ops.
   func drainQueue() async {
-    guard config != nil, !disabled, !waitingForProfile, !draining else { return }
+    guard !disabled, !waitingForProfile, !draining else { return }
     draining = true
     defer { draining = false }
 
